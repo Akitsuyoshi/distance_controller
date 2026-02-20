@@ -12,10 +12,28 @@
 #include <tuple>
 #include <vector>
 
+/**
+ * A waypoint-based position controller using
+ * independent PID loops for x, y, and yaw.
+ *
+ * The controller:
+ *  - Subscribes to filtered odometry
+ *  - Tracks a sequence of predefined waypoints
+ *  - Uses a finite state machine for motion control
+ *  - Publishes velocity commands to /cmd_vel
+ *
+ * The robot should support holonomic motion (vx, vy, wz).
+ */
 class DistanceController : public rclcpp::Node {
   using Twist = geometry_msgs::msg::Twist;
   using Odometry = nav_msgs::msg::Odometry;
 
+  /**
+   * Implements a discrete-time PID controller with:
+   *  - Configurable gains (kp, ki, kd)
+   *  - Integral windup protection (clamped integral term)
+   *  - Derivative computed using backward difference
+   */
   struct PID {
     // Tune param
     double kp{0.0};
@@ -37,11 +55,8 @@ class DistanceController : public rclcpp::Node {
     }
 
     double compute_pid(double err, double dt) {
-      if (dt <= 1e-6) {
-        dt = 1e-3;
-      }
       integral += err * dt;
-      integral = std::clamp(integral, -1.0, 1.0);
+      integral = std::clamp(integral, -5.0, 5.0);
       double deriv = (dt > 0.0) ? (err - prev_err) / dt : 0.0;
       prev_err = err;
       return kp * err + ki * integral + kd * deriv;
@@ -60,13 +75,11 @@ class DistanceController : public rclcpp::Node {
     WAITING,   // wait between track and advance
     ADVANCING, // load next waypoint
     FINISHED,  // stop after finishing all waypoint
-    FAULT,     // safety stop
+    FAULT,     // safety stop, for future use
   };
 
 public:
-  DistanceController()
-      : Node("distance_controller"), state_(State::BOOTSTRAP),
-        wait_duration_(2.0), wp_world_(get_wp()), wp_idx_(0) {
+  DistanceController() : Node("distance_controller"), wp_world_(get_wp()) {
     RCLCPP_INFO(get_logger(), "Initializing node...");
 
     pub_ = create_publisher<Twist>("/cmd_vel", 10);
@@ -77,11 +90,10 @@ public:
                                [this]() { motion_callback(); });
 
     // Set parameters for PID
-    set_pid_param();
+    set_param();
     last_pid_time_ = now();
 
-    // Init current and target position
-    update_position(0.0, 0.0, 0.0);
+    // Set first target position
     auto &wp = wp_world_[wp_idx_];
     update_target(wp.x, wp.y, wp.yaw);
 
@@ -92,6 +104,8 @@ public:
 
 private:
   void odom_callback(const Odometry::SharedPtr msg) {
+    last_odom_time_ = now();
+
     auto &position = msg->pose.pose.position;
     auto &orientation = msg->pose.pose.orientation;
     tf2::Quaternion q(orientation.x, orientation.y, orientation.z,
@@ -126,7 +140,7 @@ private:
       finish_task();
       break;
     case State::FAULT:
-      stop_robot();
+      recover_robot();
       break;
     }
   }
@@ -140,6 +154,13 @@ private:
       state_ = State::WAITING;
       return;
     }
+    // Check odom validity
+    if ((now() - last_odom_time_).seconds() > odom_timeout_) {
+      RCLCPP_ERROR(get_logger(), "Odometry timeout");
+      state_ = State::FAULT;
+      return;
+    }
+    // Compute velocity using PID controllers
     auto [vx, vy, wz] = get_vel_robot();
     publish_vel(vx, vy, wz);
   }
@@ -177,9 +198,24 @@ private:
     rclcpp::shutdown();
   }
 
+  void recover_robot() {
+    stop_robot();
+
+    // Check if odometry has been restored
+    if ((now() - last_odom_time_).seconds() <= odom_timeout_) {
+      RCLCPP_WARN(get_logger(), "Odometry restored. Recovering...");
+
+      pid_x_.clear_err();
+      pid_y_.clear_err();
+      pid_yaw_.clear_err();
+      last_pid_time_ = now();
+      state_ = State::TRACKING;
+    }
+  }
+
   bool is_reached() const {
     auto [err_x, err_y, err_yaw] = get_err();
-    return std::hypot(err_x, err_y) < 0.03 && std::abs(err_yaw) < 0.06;
+    return std::hypot(err_x, err_y) < 0.05 && std::abs(err_yaw) < 0.1;
   }
 
   std::tuple<double, double, double> get_err() const {
@@ -205,25 +241,33 @@ private:
     target_yaw_ = yaw;
   }
 
+  /**
+   * Compute velocity command {vx, vy, wz} in robot frame:
+   * - Compute position and yaw error in world frame
+   * - Transform position error into robot frame
+   * - Compute PID outputs for x, y, and yaw
+   * - Clamp outputs to maximum velocity limits
+   */
   std::tuple<double, double, double> get_vel_robot() {
     auto [dx, dy, dphi] = get_err();
-    // Transform world to robot frame
+    // Transform world to robot frame, using current robot yaw
     double err_x = std::cos(yaw_) * dx + std::sin(yaw_) * dy;
     double err_y = -std::sin(yaw_) * dx + std::cos(yaw_) * dy;
 
     rclcpp::Time now_t = now();
     double dt = (now_t - last_pid_time_).seconds();
+    // Clamp dt to prevent instability from large timing gaps
+    dt = std::clamp(dt, 0.001, 0.1);
     last_pid_time_ = now_t;
 
-    double vx = pid_x_.compute_pid(err_x, dt);
-    double vy = pid_y_.compute_pid(err_y, dt);
-    double wz = pid_yaw_.compute_pid(dphi, dt);
+    // Compute pid with feed-forward for each x, y, and yaw
+    double vx = pid_x_.compute_pid(err_x, dt) + 0.2 * err_x;
+    double vy = pid_y_.compute_pid(err_y, dt) + 0.2 * err_y;
+    double wz = pid_yaw_.compute_pid(dphi, dt) + 0.1 * dphi;
 
-    const double MAX_V = 0.75;
-    const double MAX_W = 1.5;
-    vx = std::clamp(vx, -MAX_V, MAX_V);
-    vy = std::clamp(vy, -MAX_V, MAX_V);
-    wz = std::clamp(wz, -MAX_W, MAX_W);
+    vx = std::clamp(vx, -max_v_, max_v_);
+    vy = std::clamp(vy, -max_v_, max_v_);
+    wz = std::clamp(wz, -max_w_, max_w_);
 
     return {vx, vy, wz};
   }
@@ -237,19 +281,22 @@ private:
   }
 
   std::vector<Waypoint> get_wp() const {
+    // Waypoints are defined in world frame (x, y, yaw)
     return {{0.0, 1.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, -1.0, 0.0}, {0.0, 0.0, 0.0},
             {1.0, 1.0, 0.0}, {0.0, 0.0, 0.0}, {1.0, -1.0, 0.0}, {0.0, 0.0, 0.0},
             {1.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
   }
 
-  void set_pid_param() {
+  void set_param() {
+    max_v_ = declare_parameter<double>("max_v_", 0.6);
+    max_w_ = declare_parameter<double>("max_w_", 1.2);
     pid_x_.set_param(declare_parameter<double>("pid_x.kp", 1.2),
                      declare_parameter<double>("pid_x.ki", 0.01),
-                     declare_parameter<double>("pid_x.kd", 0.03));
+                     declare_parameter<double>("pid_x.kd", 0.05));
 
     pid_y_.set_param(declare_parameter<double>("pid_y.kp", 1.2),
                      declare_parameter<double>("pid_y.ki", 0.01),
-                     declare_parameter<double>("pid_y.kd", 0.03));
+                     declare_parameter<double>("pid_y.kd", 0.05));
 
     pid_yaw_.set_param(declare_parameter<double>("pid_yaw.kp", 1.5),
                        declare_parameter<double>("pid_yaw.ki", 0.0),
@@ -260,24 +307,30 @@ private:
   rclcpp::Subscription<Odometry>::SharedPtr sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
-  State state_;
+  rclcpp::Time last_odom_time_;
+  double odom_timeout_{0.5}; // in second
+
+  State state_{State::BOOTSTRAP};
   rclcpp::Time wait_start_;
-  double wait_duration_; // in seconds
+  double wait_duration_{2.0}; // in second
 
-  PID pid_x_;
-  PID pid_y_;
-  PID pid_yaw_;
+  PID pid_x_{};
+  PID pid_y_{};
+  PID pid_yaw_{};
   rclcpp::Time last_pid_time_;
+  double max_v_{0.0};
+  double max_w_{0.0};
 
-  std::vector<Waypoint> wp_world_;
-  size_t wp_idx_;
+  std::vector<Waypoint> wp_world_{};
+  size_t wp_idx_{0};
 
-  double x_;
-  double y_;
-  double yaw_;
-  double target_x_;
-  double target_y_;
-  double target_yaw_;
+  double x_{0.0};
+  double y_{0.0};
+  double yaw_{0.0};
+
+  double target_x_{0.0};
+  double target_y_{0.0};
+  double target_yaw_{0.0};
 };
 
 int main(int argc, char *argv[]) {

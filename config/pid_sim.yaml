@@ -2,17 +2,20 @@
 
 distance_controller:
   ros__parameters:
+    max_v_: 0.9
+    max_w_: 1.5
+
     pid_x: 
-      kp: 1.2
+      kp: 1.5
       ki: 0.01
-      kd: 0.03
+      kd: 0.05
 
     pid_y:
-      kp: 1.2
+      kp: 1.5
       ki: 0.01
-      kd: 0.03
+      kd: 0.05
 
     pid_yaw:
-      kp: 1.5
+      kp: 2.0
       ki: 0.0
       kd: 0.1
