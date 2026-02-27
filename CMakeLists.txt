@@ -12,8 +12,10 @@ find_package(tf2 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 
+
 add_executable(distance_controller src/distance_controller.cpp)
 ament_target_dependencies(distance_controller rclcpp nav_msgs std_msgs tf2)
+
 
 INSTALL(TARGETS
 	distance_controller
@@ -23,6 +25,16 @@ INSTALL(TARGETS
 install(
   DIRECTORY config
   DESTINATION share/${PROJECT_NAME}
+)
+
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+
+install(
+  DIRECTORY include/
+  DESTINATION include
 )
 
 if(BUILD_TESTING)
@@ -36,5 +48,7 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+ament_export_include_directories(include)
 
 ament_package()
