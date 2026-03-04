@@ -4,6 +4,7 @@
 #include "rclcpp/logging.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/time.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/LinearMath/Vector3.h"
@@ -28,6 +29,7 @@
 class DistanceController : public rclcpp::Node {
   using Twist = geometry_msgs::msg::Twist;
   using Odometry = nav_msgs::msg::Odometry;
+  using LaserScan = sensor_msgs::msg::LaserScan;
 
   struct Waypoint {
     double x;
@@ -36,7 +38,8 @@ class DistanceController : public rclcpp::Node {
   };
 
   enum class State {
-    BOOTSTRAP, // wait for odom
+    BOOTSTRAP, // wait for init odom
+    ALIGNING,  // with LaserScan to square up with the wall
     TRACKING,  // drive to target position
     WAITING,   // wait between track and advance
     ADVANCING, // load next waypoint
@@ -45,14 +48,18 @@ class DistanceController : public rclcpp::Node {
   };
 
 public:
-  DistanceController() : Node("distance_controller"), wp_world_(get_wp()) {
+  DistanceController(int scene_num)
+      : Node("distance_controller"), scene_num_(scene_num),
+        wp_world_(get_wp()) {
     RCLCPP_INFO(get_logger(), "Initializing node...");
 
     pub_ = create_publisher<Twist>("/cmd_vel", 10);
     sub_ = create_subscription<Odometry>(
         "/odometry/filtered", 10,
         [this](Odometry::SharedPtr msg) { odom_callback(msg); });
-    timer_ = create_wall_timer(std::chrono::milliseconds(25),
+    scan_sub_ = create_subscription<LaserScan>(
+        "/scan", 10, [this](LaserScan::SharedPtr msg) { scan_callback(msg); });
+    timer_ = create_wall_timer(std::chrono::milliseconds(50),
                                [this]() { motion_callback(); });
 
     // Set parameters for PID
@@ -77,14 +84,71 @@ private:
 
     update_position(position.x, position.y, yaw);
     if (state_ == State::BOOTSTRAP) {
-      start_track();
+      RCLCPP_INFO(get_logger(), "Starting to align the robot.");
+      state_ = State::ALIGNING;
     }
+  }
+
+  void scan_callback(const LaserScan::SharedPtr msg) {
+    const auto &ranges = msg->ranges;
+    const float angle_min = msg->angle_min;
+    const float angle_inc = msg->angle_increment;
+    const size_t n = ranges.size();
+
+    // Temporary accumulators
+    double sum_f = 0, sum_b = 0, sum_l = 0, sum_r = 0;
+    int count_f = 0, count_b = 0, count_l = 0, count_r = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+      float r = ranges[i];
+      // Filter out bad data and noise spikes
+      if (std::isinf(r) || std::isnan(r)) {
+        continue;
+      }
+
+      float angle = angle_min + i * angle_inc;
+      // Back
+      if (std::abs(angle) < 0.26) {
+        sum_b += r;
+        count_b++;
+      }
+      // Front
+      else if (std::abs(angle) > 2.88) {
+        sum_f += r;
+        count_f++;
+      }
+      // Right
+      else if (angle > 1.31 && angle < 1.83) {
+        sum_r += r;
+        count_r++;
+      }
+      // Left
+      else if (angle < -1.31 && angle > -1.83) {
+        sum_l += r;
+        count_l++;
+      }
+    }
+
+    // Compute means, falling back to infinity if no rays hit anything
+    mean_front_dist_ = (count_f > 0) ? (sum_f / count_f)
+                                     : std::numeric_limits<double>::infinity();
+    mean_back_dist_ = (count_b > 0) ? (sum_b / count_b)
+                                    : std::numeric_limits<double>::infinity();
+    mean_left_dist_ = (count_l > 0) ? (sum_l / count_l)
+                                    : std::numeric_limits<double>::infinity();
+    mean_right_dist_ = (count_r > 0) ? (sum_r / count_r)
+                                     : std::numeric_limits<double>::infinity();
+    // RCLCPP_INFO(get_logger(), "L:%.2f R:%.2f B:%.2f", mean_left_dist_,
+    //             mean_right_dist_, mean_back_dist_);
   }
 
   void motion_callback() {
     switch (state_) {
     case State::BOOTSTRAP:
       stop_robot();
+      break;
+    case State::ALIGNING:
+      align_to_walls();
       break;
     case State::TRACKING:
       move_robot();
@@ -105,6 +169,35 @@ private:
   }
 
   void stop_robot() const { publish_vel(0.0, 0.0, 0.0); }
+
+  void align_to_walls() {
+    // To ensure the robot starts parallel to the maze hallway
+    if (std::isinf(mean_left_dist_) || std::isinf(mean_right_dist_) ||
+        std::isinf(mean_back_dist_)) {
+      return;
+    }
+
+    double side_diff = mean_left_dist_ - mean_right_dist_;
+    double back_err = 0.35 - mean_back_dist_;
+
+    const double torelance = 0.03;
+    bool is_centered = std::abs(side_diff) < torelance;
+    bool is_back_distanced = std::abs(back_err) < torelance;
+    if (!is_centered || !is_back_distanced) {
+      double vx = std::clamp(back_err * 0.5, -0.15, 0.15);
+      double vy = std::clamp(side_diff * 0.5, -0.15, 0.15);
+      publish_vel(vx, vy, 0.0);
+    } else {
+      // Finish alignment
+      stop_robot();
+      // Change waypoints from relative to absolute, according to the robot
+      // starting point
+      transform_world_wp_absolute();
+      RCLCPP_INFO(get_logger(), "Alignment Complete: L:%.2f R:%.2f B:%.2f",
+                  mean_left_dist_, mean_right_dist_, mean_back_dist_);
+      start_track();
+    }
+  }
 
   void move_robot() {
     if (is_reached()) {
@@ -165,7 +258,7 @@ private:
 
   void start_track() {
     auto &wp = wp_world_[wp_idx_];
-    update_target(x_ + wp.x, y_ + wp.y, yaw_ + wp.yaw);
+    update_target(wp.x, wp.y, wp.yaw);
     state_ = State::TRACKING;
     RCLCPP_INFO(get_logger(), "Moving to the waypoint %zu, [%f, %f, %f]",
                 wp_idx_, target_x_, target_y_, target_yaw_);
@@ -180,7 +273,7 @@ private:
 
   bool is_reached() const {
     auto [err_x, err_y, err_yaw] = get_err();
-    return std::hypot(err_x, err_y) < 0.06 && std::abs(err_yaw) < 0.08;
+    return std::hypot(err_x, err_y) < 0.05 && std::abs(err_yaw) < 0.1;
   }
 
   std::tuple<double, double, double> get_err() const {
@@ -197,7 +290,7 @@ private:
   void update_position(double x, double y, double yaw) {
     x_ = x;
     y_ = y;
-    yaw_ = yaw;
+    yaw_ = normalize_angle(yaw);
   }
 
   void update_target(double x, double y, double yaw) {
@@ -223,8 +316,8 @@ private:
     last_pid_time_ = now_t;
 
     // Compute pid for each x, y, and yaw with feed-forward
-    double vx = pid_x_.compute(err_x, dt, 0.2);
-    double vy = pid_y_.compute(err_y, dt, 0.2);
+    double vx = pid_x_.compute(err_x, dt, 0.1);
+    double vy = pid_y_.compute(err_y, dt, 0.1);
     double wz = pid_yaw_.compute(dphi, dt, 0.1);
 
     return {vx, vy, wz};
@@ -240,35 +333,77 @@ private:
 
   std::vector<Waypoint> get_wp() const {
     // Waypoints are defined in relative world frame (x, y, yaw)
+    switch (scene_num_) {
+    case 1: // For simulation
+      return get_sim_wp();
+    case 2: // For real cyber world
+      return get_real_wp();
+    default:
+      RCLCPP_ERROR(get_logger(), "Undefined scene number %d", scene_num_);
+      return {{0.0, 0.0, 0.0}};
+    }
+  }
+
+  std::vector<Waypoint> get_sim_wp() const {
     return {{0.0, 1.0, 0.0},  {0.0, -1.0, 0.0}, {0.0, -1.0, 0.0},
             {0.0, 1.0, 0.0},  {1.0, 1.0, 0.0},  {-1.0, -1.0, 0.0},
             {1.0, -1.0, 0.0}, {-1.0, 1.0, 0.0}, {1.0, 0.0, 0.0},
             {-1.0, 0.0, 0.0}};
   }
 
-  void set_param() {
-    pid_x_.set_gain(declare_parameter<double>("pid_x.kp", 1.2),
-                    declare_parameter<double>("pid_x.ki", 0.01),
-                    declare_parameter<double>("pid_x.kd", 0.05));
+  std::vector<Waypoint> get_real_wp() const {
+    return {
+        {0.9, 0.0, 0.0}, {0.0, -0.6, 0.0}, {0.0, 0.6, 0.0}, {-0.9, 0.0, 0.0}};
+  }
 
-    pid_y_.set_gain(declare_parameter<double>("pid_y.kp", 1.2),
+  void transform_world_wp_absolute() {
+    // The world waypoints are transformed to absolute when the node received
+    // robot init pose for the first time.
+    double current_x = x_;
+    double current_y = y_;
+    double current_yaw = yaw_;
+    for (auto &wp : wp_world_) {
+      current_yaw = normalize_angle(current_yaw + wp.yaw);
+      current_x += wp.x * std::cos(current_yaw) - wp.y * std::sin(current_yaw);
+      current_y += wp.x * sin(current_yaw) + wp.y * std::cos(current_yaw);
+
+      wp.x = current_x;
+      wp.y = current_y;
+      wp.yaw = current_yaw;
+    }
+  }
+
+  void set_param() {
+    pid_x_.set_gain(declare_parameter<double>("pid_x.kp", 1.0),
+                    declare_parameter<double>("pid_x.ki", 0.01),
+                    declare_parameter<double>("pid_x.kd", 0.1));
+
+    pid_y_.set_gain(declare_parameter<double>("pid_y.kp", 1.0),
                     declare_parameter<double>("pid_y.ki", 0.01),
-                    declare_parameter<double>("pid_y.kd", 0.05));
+                    declare_parameter<double>("pid_y.kd", 0.1));
 
     pid_yaw_.set_gain(declare_parameter<double>("pid_yaw.kp", 1.5),
                       declare_parameter<double>("pid_yaw.ki", 0.0),
                       declare_parameter<double>("pid_yaw.kd", 0.1));
 
-    double max_v = declare_parameter<double>("max_v", 0.6);
-    double max_w = declare_parameter<double>("max_w", 1.2);
+    double max_v = declare_parameter<double>("max_v", 0.4);
+    double max_w = declare_parameter<double>("max_w", 0.8);
     pid_x_.set_limit(max_v, 5.0);
     pid_y_.set_limit(max_v, 5.0);
     pid_yaw_.set_limit(max_w, 5.0);
   }
 
+  int scene_num_; // scene 1 for simulation, while 2 for cyber world
+
   rclcpp::Publisher<Twist>::SharedPtr pub_;
   rclcpp::Subscription<Odometry>::SharedPtr sub_;
+  rclcpp::Subscription<LaserScan>::SharedPtr scan_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
+
+  double mean_front_dist_ = std::numeric_limits<double>::infinity();
+  double mean_left_dist_ = std::numeric_limits<double>::infinity();
+  double mean_right_dist_ = std::numeric_limits<double>::infinity();
+  double mean_back_dist_ = std::numeric_limits<double>::infinity();
 
   rclcpp::Time last_odom_time_;
   double odom_timeout_{0.5}; // in second
@@ -296,7 +431,11 @@ private:
 
 int main(int argc, char *argv[]) {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<DistanceController>());
+  int scene_num = 1; // Default scene number to simulation
+  if (argc > 1) {
+    scene_num = std::atoi(argv[1]);
+  }
+  rclcpp::spin(std::make_shared<DistanceController>(scene_num));
   rclcpp::shutdown();
   return 0;
 }

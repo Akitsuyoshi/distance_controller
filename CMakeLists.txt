@@ -11,10 +11,11 @@ find_package(rclcpp REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 
 add_executable(distance_controller src/distance_controller.cpp)
-ament_target_dependencies(distance_controller rclcpp nav_msgs std_msgs tf2)
+ament_target_dependencies(distance_controller rclcpp nav_msgs std_msgs tf2 sensor_msgs)
 
 
 INSTALL(TARGETS
