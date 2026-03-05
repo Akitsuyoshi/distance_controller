@@ -148,7 +148,7 @@ private:
       stop_robot();
       break;
     case State::ALIGNING:
-      align_to_walls();
+      move_to_starting_point();
       break;
     case State::TRACKING:
       move_robot();
@@ -170,33 +170,25 @@ private:
 
   void stop_robot() const { publish_vel(0.0, 0.0, 0.0); }
 
-  void align_to_walls() {
-    // To ensure the robot starts parallel to the maze hallway
+  void move_to_starting_point() {
+    // This is a relative movement to get to the ideal starting point
     if (std::isinf(mean_left_dist_) || std::isinf(mean_right_dist_) ||
         std::isinf(mean_back_dist_)) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Waiting to get scan data");
       return;
     }
 
-    double side_diff = mean_left_dist_ - mean_right_dist_;
-    double back_err = 0.35 - mean_back_dist_;
+    RCLCPP_INFO(get_logger(), "Calculating initial alignment waypoint...");
 
-    const double torelance = 0.03;
-    bool is_centered = std::abs(side_diff) < torelance;
-    bool is_back_distanced = std::abs(back_err) < torelance;
-    if (!is_centered || !is_back_distanced) {
-      double vx = std::clamp(back_err * 0.5, -0.15, 0.15);
-      double vy = std::clamp(side_diff * 0.5, -0.15, 0.15);
-      publish_vel(vx, vy, 0.0);
-    } else {
-      // Finish alignment
-      stop_robot();
-      // Change waypoints from relative to absolute, according to the robot
-      // starting point
-      transform_world_wp_absolute();
-      RCLCPP_INFO(get_logger(), "Alignment Complete: L:%.2f R:%.2f B:%.2f",
-                  mean_left_dist_, mean_right_dist_, mean_back_dist_);
-      start_track();
-    }
+    double dist_to_center_y = (mean_left_dist_ - mean_right_dist_) / 2.0;
+    double dist_to_start_x =
+        0.35 - mean_back_dist_; // If we're at 0.1, move +0.25 forward
+
+    Waypoint start_alignment_wp = {dist_to_start_x, dist_to_center_y, 0.0};
+    wp_world_.insert(wp_world_.begin(), start_alignment_wp);
+    transform_world_wp_absolute();
+    start_track();
   }
 
   void move_robot() {
